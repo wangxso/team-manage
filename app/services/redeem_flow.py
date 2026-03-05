@@ -218,9 +218,24 @@ class RedeemFlowService:
                 logger.error(f"兑换前置校验异常: {e}")
                 if attempt < max_retries - 1: continue
                 return {"success": False, "error": f"系统校验异常: {str(e)}"}
-            # 确保会话回到干净状态，防止 Phase 0 的隐式事务导致 begin() 报错
+            # 确保会话回到干净状态，防止阶段 0 的隐式事务导致后面 begin() 报错
             if db_session.in_transaction():
                 await db_session.commit()
+
+            # --- 阶段 0: 预同步 Team 信息 (先更新人数) ---
+            # 确定本次尝试的目标 Team
+            is_auto_select = current_target_team_id is None
+            active_team_id = current_target_team_id
+            
+            if is_auto_select:
+                select_result = await self.select_team_auto(db_session, email=email)
+                if not select_result["success"]:
+                    return {"success": False, "error": select_result["error"]}
+                active_team_id = select_result["team_id"]
+            
+            # 同步最新人数
+            logger.info(f"兑换前同步 Team {active_team_id} 状态...")
+            await self.team_service.sync_team_info(active_team_id, db_session)
 
             team_id_final = None
             try:
@@ -249,35 +264,32 @@ class RedeemFlowService:
                     if redemption_code.status not in allowed_statuses:
                         return {"success": False, "error": "兑换码已被使用"}
 
-                    # 2. 选择 Team
-                    if current_target_team_id is None:
-                        select_result = await self.select_team_auto(db_session, email=email)
-                        if not select_result["success"]:
-                            return {"success": False, "error": select_result["error"]}
-                        team_id_final = select_result["team_id"]
-                    else:
-                        team_id_final = current_target_team_id
+                    # 2. 确定 Team (使用阶段 0 选定并同步过的 Team)
+                    team_id_final = active_team_id
 
-                    # 3. 锁定并检查 Team
+                    # 3. 锁定并检查 Team (未满再邀请)
                     stmt = select(Team).where(Team.id == team_id_final).with_for_update()
                     result = await db_session.execute(stmt)
                     team = result.scalar_one_or_none()
 
                     if not team:
-                        if current_target_team_id is None and attempt < max_retries - 1:
+                        if is_auto_select and attempt < max_retries - 1:
                             logger.warning(f"选择的 Team {team_id_final} 消失了, 尝试下一次循环")
+                            current_target_team_id = None
                             continue
                         return {"success": False, "error": f"Team {team_id_final} 不存在"}
                     
                     if team.current_members >= team.max_members:
-                        if current_target_team_id is None and attempt < max_retries - 1:
+                        if is_auto_select and attempt < max_retries - 1:
                             logger.warning(f"选择的 Team {team_id_final} 已满, 尝试下一次循环")
+                            current_target_team_id = None
                             continue 
                         return {"success": False, "error": "Team 已满，请选择其他 Team"}
                     
                     if team.status != "active":
-                        if current_target_team_id is None and attempt < max_retries - 1:
+                        if is_auto_select and attempt < max_retries - 1:
                             logger.warning(f"选择的 Team {team_id_final} 状态异常 ({team.status}), 尝试下一次循环")
+                            current_target_team_id = None
                             continue
                         return {"success": False, "error": f"Team 状态异常: {team.status}"}
 
@@ -361,9 +373,31 @@ class RedeemFlowService:
                             is_warranty_redemption=final_is_warranty
                         )
                         db_session.add(redemption_record)
+
+                        # 成功后人数+1 (先本地更新，确保即时性)
+                        stmt = select(Team).where(Team.id == team_id_final).with_for_update()
+                        res = await db_session.execute(stmt)
+                        t = res.scalar_one_or_none()
+                        if t:
+                            t.current_members += 1
+                            if t.current_members >= t.max_members:
+                                t.status = "full"
                         
+                    # 确保在 sleep 前没有任何未决事务，彻底释放读视图，避免占用数据库资源
+                    if db_session.in_transaction():
+                        await db_session.rollback()
+                    db_session.expire_all()
+
+                    # 延时 5 秒再同步，给 API 留出同步缓冲时间，减少虚假成功误判
+                    logger.info(f"等待 5 秒后校验邀请结果: {email}")
+                    await asyncio.sleep(5)
+
                     # 同步最新成员数并校验邀请是否生效
                     sync_res = await self.team_service.sync_team_info(team_id_final, db_session)
+                    
+                    # 显式提交同步结果，确保 last_sync 等信息已写入数据库
+                    if db_session.in_transaction():
+                        await db_session.commit()
                     
                     # 强校验：如果同步结果中没有当前邮箱，说明是“虚假成功”
                     member_emails = sync_res.get("member_emails", [])
@@ -380,7 +414,7 @@ class RedeemFlowService:
                             target_team = res.scalar_one_or_none()
                             if target_team:
                                 target_team.error_count = (target_team.error_count or 0) + 1
-                                if target_team.error_count >= 3:
+                                if target_team.error_count >= 2:
                                     logger.error(f"Team {target_team.id} 连续虚假成功/错误 {target_team.error_count} 次，标记为 error")
                                     target_team.status = "error"
                                 await db_session.commit()
