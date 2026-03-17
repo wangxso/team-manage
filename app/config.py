@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     # 代理配置
     proxy: str = ""
     proxy_enabled: bool = False
+    session_https_only: bool = False
 
     # JWT 配置
     jwt_verify_signature: bool = False
